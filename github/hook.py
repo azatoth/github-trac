@@ -60,18 +60,19 @@ import sys
 from datetime import datetime
 
 from trac.env import open_environment
-from trac.ticket.notification import TicketNotifyEmail
-from trac.ticket import Ticket
-from trac.ticket.web_ui import TicketModule
+
 # TODO: move grouped_changelog_entries to model.py
 from trac.util.text import to_unicode
 from trac.util.datefmt import utc
-from trac.versioncontrol.api import NoSuchChangeset
-from trac.config import Option, IntOption, ListOption, BoolOption
+
+from agilo.ticket.model import AgiloTicket, AgiloTicketModelManager
+from agilo.utils import Key, Status
+from agilo.utils.errors import *
+from agilo.utils.config import AgiloConfig
 
 ticket_prefix = '(?:#|(?:ticket|issue|bug)[: ]?)'
 ticket_reference = ticket_prefix + '[0-9]+'
-ticket_command =  (r'(?P<action>[A-Za-z]*).?'
+ticket_command = (r'(?P<action>[A-Za-z]*).?'
                    '(?P<ticket>%s(?:(?:[, &]*|[ ]?and[ ]?)%s)*)' %
                    (ticket_reference, ticket_reference))
      
@@ -95,25 +96,18 @@ class CommitHook:
 
     def __init__(self, env):
         self.env = env
+        self.tm = AgiloTicketModelManager(self.env)
 
-    def process(self, commit, status, enable_revmap):
+    def process(self, commit, status, jsondata):
         self.closestatus = status
         
         msg = commit['message']
-        self.env.log.debug("Processing Commit: %s", msg)
-        note = "Changeset: %s" % commit['id']
-        msg = "%s \n %s" % (msg, note)
-        author = commit['author']['name']
-        timestamp = datetime.now(utc)
-        if int(enable_revmap):
-            self.env.log.debug("adding commit %s to revmap", commit['id'])
-            db = self.env.get_db_cnx()
-            cursor = db.cursor()
-            cursor.execute("INSERT INTO svn_revmap (svn_rev, git_hash, commit_msg) VALUES (0, %s, %s);",
-                    (commit['id'], commit['message']))
-            db.commit()
+        self.env.log.debug("Processing a Commit: %s", msg)
+        note = "Changeset: [/changeset/%(repo)s/commit/%(id)s %(repo)s/%(id)s]" % { 'repo': jsondata['repository']['name'], 'id': commit['id']}
+        self.msg = "%s \n %s" % (msg, note)
+        self.author = commit['author']['name']
         
-        cmd_groups = command_re.findall(msg)
+        cmd_groups = command_re.findall(self.msg)
         self.env.log.debug("Function Handlers: %s" % cmd_groups)
 
         tickets = {}
@@ -123,38 +117,44 @@ class CommitHook:
             if funcname:
                 for tkt_id in ticket_re.findall(tkts):
                     func = getattr(self, funcname)
-                    tickets.setdefault(tkt_id, []).append(func)
+                    tickets.setdefault(int(tkt_id), []).append(func)
 
-        for tkt_id, cmds in tickets.iteritems():
-            try:
-                db = self.env.get_db_cnx()
-                
-                ticket = Ticket(self.env, int(tkt_id), db)
-                for cmd in cmds:
-                    cmd(ticket)
+        for t_id, cmds in tickets.iteritems():
+            ticket = self.tm.get(tkt_id=t_id)
+            for cmd in cmds:
+                cmd(ticket)
 
-                # determine sequence number... 
-                cnum = 0
-                tm = TicketModule(self.env)
-                for change in tm.grouped_changelog_entries(ticket, db):
-                    if change['permanent']:
-                        cnum += 1
-                
-                ticket.save_changes(author, msg, timestamp, db, cnum+1)
-                db.commit()
-                
-                tn = TicketNotifyEmail(self.env)
-                tn.notify(ticket, newticket=0, modtime=timestamp)
-            except Exception, e:
-                import traceback
-                traceback.print_exc(file=sys.stderr)
-                #print>>sys.stderr, 'Unexpected error while processing ticket ' \
-                                   #'ID %s: %s' % (tkt_id, e)
-            
+            self.tm.save(ticket, author=self.author, comment=self.msg)
+            from trac.ticket.notification import TicketNotifyEmail
+            tn = TicketNotifyEmail(self.env)
+            tn.notify(ticket, newticket=False, modtime=ticket.time_changed)				
+
 
     def _cmdClose(self, ticket):
-        ticket['status'] = self.closestatus
-        ticket['resolution'] = 'fixed'
+        """
+        Closes a ticket and applies all the defined rules
+        """
+        if isinstance(ticket, AgiloTicket):
+            if ticket.is_writeable_field(Key.REMAINING_TIME):
+                owner = ticket[Key.OWNER]
+                ticket[Key.STATUS] = Status.CLOSED
+                ticket[Key.RESOLUTION] = Status.RES_FIXED
+                ticket[Key.REMAINING_TIME] = '0'
+            else:
+                # Check if all the linked items are closed than close it
+                close = True
+                for linked in ticket.get_outgoing():
+                    if linked[Key.STATUS] != Status.CLOSED:
+                        close = False
+                        break
+                if close:
+                    ticket[Key.STATUS] = Status.CLOSED
+                    ticket[Key.RESOLUTION] = Status.RES_FIXED
+                else:
+                    self.env.log.info("The ticket(#%d) of type: '%s' has still "\
+                            "some open dependencies... can't close it!" % \
+                            (ticket.get_id(), ticket.get_type()))
+                    # Return the method
 
     def _cmdRefs(self, ticket):
         pass
